@@ -113,5 +113,4 @@ python website_cloner.py https://example.com --single-page --no-media
 - **Rate limits**: Some servers may block or rate-limit rapid requests. Use `--delay` to increase the time between requests.
 
 ## License
-
-MIT
+GNU GENERAL PUBLIC LICENSE
