@@ -24,7 +24,7 @@ log = logging.getLogger("website_cloner")
 MEDIA = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".ico", ".bmp", ".avif", ".mp4", ".webm", ".ogg", ".mp3", ".wav", ".flac", ".woff", ".woff2", ".ttf", ".eot", ".otf", ".pdf", ".zip", ".gz", ".tar", ".rar"}
 CSS_URL = re.compile(r'''url\(\s*(["']?)(.*?)\1\s*\)''', re.I)
 CSS_IMPORT = re.compile(r'''@import\s+(?:url\(\s*)?(["'])(.*?)\1\s*\)?''', re.I)
-JS_ASSET = re.compile(r'''["']((?:(?:\.\.?/)|/)?[^"'?#\s]+\.(?:js|mjs|css|wasm|json|woff2?|ttf|eot|svg|png|jpe?g|webp|avif|gif))(?:\?[^"']*)?["']''', re.I)
+JS_ASSET = re.compile(r'''["']((?:\.\.?/|/)[^"'?#\s]+\.(?:js|mjs|css|wasm|json|woff2?|ttf|eot|svg|png|jpe?g|webp|avif|gif))(?:\?[^"']*)?["']''', re.I)
 SKIP = ("data:", "blob:", "javascript:", "mailto:", "tel:", "about:")
 
 
