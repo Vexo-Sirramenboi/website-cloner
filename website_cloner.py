@@ -127,25 +127,86 @@ class WebsiteCloner:
             if count >= 500:
                 break
 
+
     def discover_html(self, soup, url, depth):
+        base_tag = soup.find("base", href=True)
+        base_url = (
+            urllib.parse.urljoin(url, base_tag["href"])
+            if base_tag else url
+        )
+
+        # Discover linked HTML pages.
         if depth < self.depth and not self.single_page:
             for tag in soup.find_all("a", href=True):
-                self.enqueue(tag["href"], depth + 1, url)
-        for tag in soup.find_all(["img", "source", "video", "audio", "track", "embed"]):
-            for attr in ("src", "data-src", "data-lazy-src", "poster"):
-                if tag.get(attr): self.enqueue(tag[attr], depth, url)
-            if tag.get("srcset"):
-                for item in tag["srcset"].split(","):
+                self.enqueue(tag["href"], depth + 1, base_url)
+
+        # Discover embedded resources and lazy-loaded media.
+        resource_tags = [
+            "img", "source", "video", "audio", "track",
+            "embed", "iframe", "object", "input"
+        ]
+
+        resource_attrs = [
+            "src", "data-src", "data-lazy-src",
+            "data-original", "data-url", "data-original-src",
+            "poster", "data"
+        ]
+
+        for tag in soup.find_all(resource_tags):
+            for attr in resource_attrs:
+                value = tag.get(attr)
+                if value:
+                    self.enqueue(value, depth, base_url)
+
+            # Discover responsive images.
+            srcset = tag.get("srcset") or tag.get("data-srcset")
+            if srcset:
+                for item in srcset.split(","):
                     bits = item.strip().split()
-                    if bits: self.enqueue(bits[0], depth, url)
+                    if bits:
+                        self.enqueue(bits[0], depth, base_url)
+
+        # Discover stylesheets, icons, manifests and preloaded files.
         for tag in soup.find_all("link", href=True):
             rel = " ".join(tag.get("rel", [])).lower()
-            if any(x in rel for x in ("stylesheet", "icon", "preload", "modulepreload", "manifest", "apple-touch-icon")):
-                self.enqueue(tag["href"], depth, url)
-        for tag in soup.find_all("script", src=True): self.enqueue(tag["src"], depth, url)
+
+            if any(x in rel for x in (
+                "stylesheet", "icon", "preload",
+                "modulepreload", "manifest",
+                "apple-touch-icon", "prefetch"
+            )):
+                self.enqueue(tag["href"], depth, base_url)
+
+        # Discover external JavaScript.
+        for tag in soup.find_all("script", src=True):
+            self.enqueue(tag["src"], depth, base_url)
+
+        # Discover URLs in inline CSS.
         for tag in soup.find_all("style"):
-            self.discover_css(tag.get_text() or "", url, depth)
-        for tag in soup.find_all(style=True): self.discover_css(tag.get("style", ""), url, depth)
+            self.discover_css(
+                tag.get_text() or "", base_url, depth
+            )
+
+        for tag in soup.find_all(style=True):
+            self.discover_css(
+                tag.get("style", ""), base_url, depth
+            )
+
+        # Discover meta-refresh redirects.
+        for tag in soup.find_all(
+            "meta", attrs={"http-equiv": True}
+        ):
+            if tag.get("http-equiv", "").lower() == "refresh":
+                content = tag.get("content", "")
+                match = re.search(
+                    r"""url\s*=\s*['"]?(.+?)['"]?$""",
+                    content,
+                    re.I
+                )
+                if match:
+                    self.enqueue(
+                        match.group(1), depth + 1, base_url
+                    )
 
     def rel(self, asset_url, from_path):
         try:
@@ -245,11 +306,11 @@ def main():
     parser = argparse.ArgumentParser(description="Download a static copy of a website for authorized archiving.")
     parser.add_argument("url")
     parser.add_argument("-o", "--output", default=None)
-    parser.add_argument("-d", "--depth", type=int, default=2, help="HTML link depth (default: 2)")
+    parser.add_argument( "-d", "--depth", type=int, default=4, help="Maximum HTML link depth (default: 4)")
     parser.add_argument("--single-page", action="store_true")
     parser.add_argument("--no-media", action="store_true")
     parser.add_argument("--delay", type=float, default=.25)
-    parser.add_argument("--max-resources", type=int, default=2000)
+    parser.add_argument("--max-resources", type=int, default=5000, help="Maximum URLs to fetch (default: 5000)")
     parser.add_argument("--timeout", type=float, default=25)
     args = parser.parse_args()
     candidate = args.url if "://" in args.url else "https://" + args.url
