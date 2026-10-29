@@ -1,27 +1,29 @@
+
 name: Run JavaScript URL Parser
 
 on:
-workflow_dispatch:
+  workflow_dispatch:
 
 jobs:
-parse:
-runs-on: ubuntu-latest
-steps:
-- uses: actions/checkout@v4
+  parse:
+    runs-on: ubuntu-latest
 
-```
-  - uses: actions/setup-python@v5
-    with:
-      python-version: "3.12"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-  - name: Parse JavaScript files
-    run: |
-      mkdir -p results
-      python parser.py > results/candidate_urls.txt
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-  - name: Upload parser results
-    uses: actions/upload-artifact@v4
-    with:
-      name: candidate-urls
-      path: results/candidate_urls.txt
-```
+      - name: Parse JavaScript files
+        run: |
+          mkdir -p results
+          python parser.py > results/candidate_urls.txt
+
+      - name: Upload parser results
+        uses: actions/upload-artifact@v4
+        with:
+          name: candidate-urls
+          path: results/candidate_urls.txt
