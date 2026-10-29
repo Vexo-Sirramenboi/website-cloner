@@ -8,64 +8,111 @@ ROOT = Path("youretheblessed.com")
 OUTPUT = Path("found_urls.txt")
 
 PATTERNS = [
+    # Absolute HTTP and HTTPS URLs
     re.compile(r"""https?://[^\s"'`<>\\]+"""),
+
+    # Quoted root-relative paths
     re.compile(r"""["'`](/[^"'`\s<>]{1,300})["'`]"""),
+
+    # Common URL-bearing JavaScript properties
+    re.compile(
+        r"""(?:url|href|endpoint|api|src|path)\s*[:=]\s*
+        ["'`]([^"'`]{1,300})["'`]""",
+        re.IGNORECASE | re.VERBOSE,
+    ),
 ]
 
-REGEX_FRAGMENTS = (
-    ".*", ".+", ".*?", ".+?", "([^", "(?:",
-    "\\", "$", "^", "[", "]", "{", "}",
-)
+def clean_candidate(value):
+    value = value.strip().rstrip("),;.")
 
-found = set()
-files = list(ROOT.rglob("*.js"))
+    if not value:
+        return None
 
-print(f"Scanning {len(files)} JavaScript files...")
+    # Reject obvious regular-expression fragments.
+    if any(char in value for char in ("\n", "\r", "\t")):
+        return None
 
-for path in files:
-    try:
-        source = path.read_text(
-            encoding="utf-8",
-            errors="ignore",
-        )
-    except OSError:
-        continue
+    if value.startswith(("//", "#", "?", "\\")):
+        return None
 
-    for pattern in PATTERNS:
-        for match in pattern.findall(source):
-            value = match.rstrip("),;.")
+    if value.startswith(("data:", "javascript:", "blob:")):
+        return None
 
-            if not value or any(
-                marker in value for marker in REGEX_FRAGMENTS
-            ):
-                continue
+    if value.startswith(("http://", "https://")):
+        parsed = urlparse(value)
 
-            if value.startswith("http://") or value.startswith("https://"):
-                parsed = urlparse(value)
+        if parsed.hostname != "youretheblessed.com":
+            return None
 
-                if parsed.hostname != "youretheblessed.com":
-                    continue
-            else:
-                parsed = urlparse(value)
+        return value
 
-                if not parsed.path.startswith("/"):
-                    continue
+    # Keep only root-relative paths or plausible relative URLs.
+    if value.startswith("/"):
+        result = urljoin(BASE_URL, value)
+    else:
+        # Avoid treating arbitrary JavaScript strings as URLs.
+        if not value.startswith(("./", "../")):
+            return None
+        result = urljoin(BASE_URL, value)
 
-                value = urljoin(BASE_URL, value)
-                parsed = urlparse(value)
+    parsed = urlparse(result)
 
-                if parsed.hostname != "youretheblessed.com":
-                    continue
+    if parsed.hostname != "youretheblessed.com":
+        return None
 
-            if parsed.path in ("", "/") and not parsed.query:
-                continue
+    if not parsed.path or parsed.path == "/":
+        return None
 
-            found.add(value)
+    return result
 
-OUTPUT.write_text(
-    "\n".join(sorted(found)) + ("\n" if found else ""),
-    encoding="utf-8",
-)
 
-print(f"\nTotal candidate URLs: {len(found)}")
-print(f"Results saved to: {OUTPUT}")
+def main():
+    if not ROOT.is_dir():
+        print(f"ERROR: Folder not found: {ROOT}")
+        print("Make sure the folder is committed to your repository.")
+        return
+
+    files = sorted(ROOT.rglob("*.js"))
+    found = set()
+
+    print(f"Scanning {len(files)} JavaScript files...\n")
+
+    for path in files:
+        try:
+            source = path.read_text(
+                encoding="utf-8",
+                errors="ignore",
+            )
+        except OSError as exc:
+            print(f"Could not read {path}: {exc}")
+            continue
+
+        for pattern in PATTERNS:
+            for match in pattern.findall(source):
+                candidate = clean_candidate(match)
+
+                if candidate:
+                    found.add(candidate)
+
+    OUTPUT.write_text(
+        "\n".join(sorted(found))
+        + ("\n" if found else ""),
+        encoding="utf-8",
+    )
+
+    print("=" * 50)
+    print("DISCOVERED URL CANDIDATES")
+    print("=" * 50)
+
+    if found:
+        for url in sorted(found):
+            print(url)
+    else:
+        print("No candidate URLs found.")
+
+    print(f"\nTotal candidate URLs: {len(found)}")
+    print(f"Results saved to: {OUTPUT.resolve()}")
+
+
+if __name__ == "__main__":
+    main()
