@@ -3,39 +3,39 @@ import re
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
-BASE_URL = "https://youretheblessed.com/"
 ROOT = Path("youretheblessed.com")
+BASE_URL = "https://youretheblessed.com/"
 OUTPUT = Path("found_urls.txt")
 
-PATTERNS = [
-    # Absolute HTTP and HTTPS URLs
-    re.compile(r"""https?://[^\s"'`<>\\]+"""),
+# Match quoted strings, including escaped characters.
+STRING_RE = re.compile(
+    r"""(["'`])((?:\\.|(?!\1)[^\\])*?)\1""",
+    re.DOTALL,
+)
 
-    # Quoted root-relative paths
-    re.compile(r"""["'`](/[^"'`\s<>]{1,300})["'`]"""),
+ABSOLUTE_RE = re.compile(r"https?://[^\s\"'`<>\\]+", re.I)
 
-    # Common URL-bearing JavaScript properties
-    re.compile(
-        r"""(?:url|href|endpoint|api|src|path)\s*[:=]\s*
-        ["'`]([^"'`]{1,300})["'`]""",
-        re.IGNORECASE | re.VERBOSE,
-    ),
-]
+# Obvious regex fragments that must never become routes.
+BAD_PATHS = {
+    "$", "&", "*", "\\", "g", "h", "l",
+}
 
-def clean_candidate(value):
-    value = value.strip().rstrip("),;.")
+def clean_url(value):
+    value = value.strip().rstrip(".,;:)")
 
-    if not value:
+    if not value or len(value) > 2048:
         return None
 
-    # Reject obvious regular-expression fragments.
-    if any(char in value for char in ("\n", "\r", "\t")):
+    if any(c in value for c in "\r\n\t"):
         return None
 
     if value.startswith(("//", "#", "?", "\\")):
         return None
 
-    if value.startswith(("data:", "javascript:", "blob:")):
+    if value in BAD_PATHS:
+        return None
+
+    if re.search(r"\(\?[:=!<]|\\[dDsSwWbBAZ]|\\\(|\\\)|\[\^", value):
         return None
 
     if value.startswith(("http://", "https://")):
@@ -44,23 +44,24 @@ def clean_candidate(value):
         if parsed.hostname != "youretheblessed.com":
             return None
 
+        if parsed.path in ("", "/") and not parsed.query:
+            return None
+
         return value
 
-    # Keep only root-relative paths or plausible relative URLs.
-    if value.startswith("/"):
-        result = urljoin(BASE_URL, value)
-    else:
-        # Avoid treating arbitrary JavaScript strings as URLs.
-        if not value.startswith(("./", "../")):
-            return None
-        result = urljoin(BASE_URL, value)
+    if not value.startswith("/"):
+        return None
 
+    if value.startswith(("/$", "/*", "/&", "/\\")):
+        return None
+
+    result = urljoin(BASE_URL, value)
     parsed = urlparse(result)
 
     if parsed.hostname != "youretheblessed.com":
         return None
 
-    if not parsed.path or parsed.path == "/":
+    if parsed.path in ("", "/"):
         return None
 
     return result
@@ -69,13 +70,12 @@ def clean_candidate(value):
 def main():
     if not ROOT.is_dir():
         print(f"ERROR: Folder not found: {ROOT}")
-        print("Make sure the folder is committed to your repository.")
         return
 
     files = sorted(ROOT.rglob("*.js"))
     found = set()
 
-    print(f"Scanning {len(files)} JavaScript files...\n")
+    print(f"Scanning {len(files)} JavaScript files...")
 
     for path in files:
         try:
@@ -87,12 +87,22 @@ def main():
             print(f"Could not read {path}: {exc}")
             continue
 
-        for pattern in PATTERNS:
-            for match in pattern.findall(source):
-                candidate = clean_candidate(match)
+        # Extract absolute URLs separately.
+        for match in ABSOLUTE_RE.findall(source):
+            url = clean_url(match)
+            if url:
+                found.add(url)
 
-                if candidate:
-                    found.add(candidate)
+        # Inspect quoted strings for relative routes.
+        for match in STRING_RE.finditer(source):
+            value = match.group(2)
+
+            # Decode common escaped slashes.
+            value = value.replace(r"\/", "/")
+
+            url = clean_url(value)
+            if url:
+                found.add(url)
 
     OUTPUT.write_text(
         "\n".join(sorted(found))
@@ -100,18 +110,14 @@ def main():
         encoding="utf-8",
     )
 
-    print("=" * 50)
-    print("DISCOVERED URL CANDIDATES")
-    print("=" * 50)
+    print("\nDISCOVERED URL CANDIDATES")
+    print("=" * 40)
 
-    if found:
-        for url in sorted(found):
-            print(url)
-    else:
-        print("No candidate URLs found.")
+    for url in sorted(found):
+        print(url)
 
     print(f"\nTotal candidate URLs: {len(found)}")
-    print(f"Results saved to: {OUTPUT.resolve()}")
+    print(f"Results saved to: {OUTPUT}")
 
 
 if __name__ == "__main__":
