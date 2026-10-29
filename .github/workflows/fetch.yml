@@ -20,54 +20,48 @@ concurrency:
 jobs:
   download:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
         with:
           ref: ${{ github.ref_name }}
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
-          cache-dependency-path: requirements.txt
 
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
-      - name: Cache Playwright browsers
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-chromium-${{ runner.os }}-v1
-
-      - name: Install Chromium
+      - name: Install Playwright Chromium
         run: python -m playwright install --with-deps chromium
 
-      - name: Read target URL
+      - name: Read and validate target URL
         id: target
         shell: bash
         run: |
           set -euo pipefail
 
-          URL="$(head -n 1 target.txt | tr -d '\r')"
+          URL="$(head -n 1 target.txt | tr -d '\r' | xargs)"
 
           if [[ ! "$URL" =~ ^https?:// ]]; then
-            echo "Error: target.txt must contain an HTTP or HTTPS URL."
+            echo "::error::target.txt must contain a valid HTTP or HTTPS URL."
             exit 1
           fi
 
           python - "$URL" <<'PY'
           import sys
-          from urllib.parse import urlsplit
+          import urllib.parse
 
           url = sys.argv[1]
-          parsed = urlsplit(url)
+          parsed = urllib.parse.urlsplit(url)
 
           if (
               parsed.scheme not in ("http", "https")
@@ -75,13 +69,20 @@ jobs:
               or parsed.username
               or parsed.password
           ):
-              raise SystemExit("Error: Invalid or unsafe target URL.")
+              raise SystemExit("Invalid or unsupported target URL")
+
+          try:
+              parsed.port
+          except ValueError:
+              raise SystemExit("Invalid port in target URL")
+
+          print("Target URL validated.")
           PY
 
           echo "url=$URL" >> "$GITHUB_OUTPUT"
 
-      - name: Clone website
-        id: clone
+      - name: Prepare output directory
+        id: output
         env:
           TARGET_URL: ${{ steps.target.outputs.url }}
         shell: bash
@@ -93,18 +94,63 @@ jobs:
             "$TARGET_URL")"
 
           echo "output_dir=$OUTPUT_DIR" >> "$GITHUB_OUTPUT"
+          echo "Website output directory: $OUTPUT_DIR"
+
+      - name: Download website
+        id: clone
+        env:
+          TARGET_URL: ${{ steps.target.outputs.url }}
+          OUTPUT_DIR: ${{ steps.output.outputs.output_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
 
           python website_cloner.py "$TARGET_URL" \
             --output "$OUTPUT_DIR" \
             --depth 10 \
             --max-resources 20000 \
             --delay 0.25 \
-            --timeout 30
+            --timeout 30 \
+            --max-scrolls 25 \
+            --max-asset-mb 50 \
+            --sitemaps
+
+          if [[ ! -f "$OUTPUT_DIR/_crawl_report.json" ]]; then
+            echo "::error::Crawl report was not generated."
+            exit 1
+          fi
+
+          echo "output_dir=$OUTPUT_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Show crawl summary
+        if: always()
+        env:
+          OUTPUT_DIR: ${{ steps.output.outputs.output_dir }}
+        shell: bash
+        run: |
+          if [[ -f "$OUTPUT_DIR/_crawl_report.json" ]]; then
+            python - "$OUTPUT_DIR/_crawl_report.json" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as file:
+              report = json.load(file)
+
+          print("Start URL:", report.get("start_url"))
+          print("Processed:", report.get("downloaded_or_processed"))
+          print("Discovered:", report.get("discovered"))
+          print("Failed:", report.get("failed_count"))
+          print("Remaining:", report.get("unprocessed_count"))
+          PY
+          else
+            echo "No crawl report available."
+          fi
 
       - name: Commit website to repository
         if: success()
         env:
-          OUTPUT_DIR: ${{ steps.clone.outputs.output_dir }}
+          OUTPUT_DIR: ${{ steps.output.outputs.output_dir }}
+          BRANCH_NAME: ${{ github.ref_name }}
         shell: bash
         run: |
           set -euo pipefail
@@ -119,5 +165,5 @@ jobs:
             echo "No website changes to commit."
           else
             git commit -m "Update downloaded website"
-            git push origin "HEAD:${GITHUB_REF_NAME}"
+            git push origin "HEAD:$BRANCH_NAME"
           fi
