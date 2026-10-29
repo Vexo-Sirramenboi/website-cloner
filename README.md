@@ -23,7 +23,7 @@ A Python tool that downloads a complete website — including HTML, CSS, JavaScr
 ## Installation
 
 ```bash
-git clone https://github.com/pershi811/website-cloner.git
+git clone https://github.com/Vexo-Sirramenboi/website-clone.git
 cd website-cloner
 pip install -r requirements.txt
 ```
