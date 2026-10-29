@@ -11,7 +11,7 @@ on:
       - .github/workflows/website-downloader.yml
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   download:
@@ -21,6 +21,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -37,7 +39,7 @@ jobs:
           URL="$(head -n 1 target.txt | tr -d '\r')"
 
           if [[ ! "$URL" =~ ^https?:// ]]; then
-            echo "Error: target.txt must contain a valid HTTP or HTTPS URL."
+            echo "Error: target.txt must contain an HTTP or HTTPS URL."
             exit 1
           fi
 
@@ -60,27 +62,19 @@ jobs:
             --depth 2 \
             --max-resources 2000
 
-      - name: Verify downloaded website
+      - name: Commit website to repository
         env:
           OUTPUT_DIR: ${{ steps.clone.outputs.output_dir }}
+        shell: bash
         run: |
-          if [ ! -d "$OUTPUT_DIR" ]; then
-            echo "Error: Website output folder was not created."
-            exit 1
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -f "$OUTPUT_DIR"
+
+          if git diff --cached --quiet; then
+            echo "No website changes to commit."
+          else
+            git commit -m "Update downloaded website"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
           fi
-
-          if [ -z "$(find "$OUTPUT_DIR" -type f -print -quit)" ]; then
-            echo "Error: Website output folder is empty."
-            exit 1
-          fi
-
-          echo "Website downloaded successfully to: $OUTPUT_DIR"
-          find "$OUTPUT_DIR" -maxdepth 2 -type f | head -50
-
-      - name: Upload downloaded website folder
-        uses: actions/upload-artifact@v4
-        with:
-          name: website-download
-          path: ${{ steps.clone.outputs.output_dir }}/
-          if-no-files-found: error
-          retention-days: 7
