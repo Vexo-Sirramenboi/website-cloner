@@ -1,0 +1,78 @@
+
+name: Website Downloader
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - target.txt
+      - website_cloner_fixed.py
+      - requirements.txt
+      - .github/workflows/website-downloader.yml
+
+permissions:
+  contents: read
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Read target URL
+        id: target
+        shell: bash
+        run: |
+          URL="$(head -n 1 target.txt | tr -d '\r')"
+
+          if [[ ! "$URL" =~ ^https?:// ]]; then
+            echo "Error: target.txt must contain an HTTP or HTTPS URL."
+            exit 1
+          fi
+
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Clone website
+        id: clone
+        env:
+          TARGET_URL: ${{ steps.target.outputs.url }}
+        shell: bash
+        run: |
+          OUTPUT_DIR="$(python -c \
+            'import sys, urllib.parse; print(urllib.parse.urlsplit(sys.argv[1]).hostname or "cloned_site")' \
+            "$TARGET_URL")"
+
+          echo "output_dir=$OUTPUT_DIR" >> "$GITHUB_OUTPUT"
+
+          python website_cloner_fixed.py "$TARGET_URL" \
+            --output "$OUTPUT_DIR" \
+            --depth 2 \
+            --max-resources 2000
+
+      - name: Create ZIP archive
+        env:
+          OUTPUT_DIR: ${{ steps.clone.outputs.output_dir }}
+        run: |
+          test -d "$OUTPUT_DIR"
+          cd "$OUTPUT_DIR"
+          zip -qr "$RUNNER_TEMP/website-download.zip" .
+          test -s "$RUNNER_TEMP/website-download.zip"
+
+      - name: Upload ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: website-download
+          path: ${{ runner.temp }}/website-download.zip
+          if-no-files-found: error
+          retention-days: 7
