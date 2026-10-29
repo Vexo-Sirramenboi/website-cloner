@@ -1,4 +1,4 @@
-
+  
 name: Website Downloader
 
 on:
@@ -59,8 +59,10 @@ jobs:
 
           python website_cloner.py "$TARGET_URL" \
             --output "$OUTPUT_DIR" \
-            --depth 2 \
-            --max-resources 2000
+            --depth 10 \
+            --max-resources 20000 \
+            --delay 0.25 \
+            --timeout 30
 
       - name: Commit website to repository
         env:
