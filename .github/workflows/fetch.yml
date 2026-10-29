@@ -6,7 +6,7 @@ on:
   push:
     paths:
       - target.txt
-      - website_cloner_fixed.py
+      - website_cloner.py
       - requirements.txt
       - .github/workflows/website-downloader.yml
 
@@ -37,7 +37,7 @@ jobs:
           URL="$(head -n 1 target.txt | tr -d '\r')"
 
           if [[ ! "$URL" =~ ^https?:// ]]; then
-            echo "Error: target.txt must contain an HTTP or HTTPS URL."
+            echo "Error: target.txt must contain a valid HTTP or HTTPS URL."
             exit 1
           fi
 
@@ -55,24 +55,32 @@ jobs:
 
           echo "output_dir=$OUTPUT_DIR" >> "$GITHUB_OUTPUT"
 
-          python website_cloner_fixed.py "$TARGET_URL" \
+          python website_cloner.py "$TARGET_URL" \
             --output "$OUTPUT_DIR" \
             --depth 2 \
             --max-resources 2000
 
-      - name: Create ZIP archive
+      - name: Verify downloaded website
         env:
           OUTPUT_DIR: ${{ steps.clone.outputs.output_dir }}
         run: |
-          test -d "$OUTPUT_DIR"
-          cd "$OUTPUT_DIR"
-          zip -qr "$RUNNER_TEMP/website-download.zip" .
-          test -s "$RUNNER_TEMP/website-download.zip"
+          if [ ! -d "$OUTPUT_DIR" ]; then
+            echo "Error: Website output folder was not created."
+            exit 1
+          fi
 
-      
+          if [ -z "$(find "$OUTPUT_DIR" -type f -print -quit)" ]; then
+            echo "Error: Website output folder is empty."
+            exit 1
+          fi
+
+          echo "Website downloaded successfully to: $OUTPUT_DIR"
+          find "$OUTPUT_DIR" -maxdepth 2 -type f | head -50
+
       - name: Upload downloaded website folder
         uses: actions/upload-artifact@v4
         with:
           name: website-download
           path: ${{ steps.clone.outputs.output_dir }}/
           if-no-files-found: error
+          retention-days: 7
