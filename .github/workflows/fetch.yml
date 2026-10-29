@@ -69,10 +69,10 @@ jobs:
           zip -qr "$RUNNER_TEMP/website-download.zip" .
           test -s "$RUNNER_TEMP/website-download.zip"
 
-      - name: Upload ZIP artifact
+      
+      - name: Upload downloaded website folder
         uses: actions/upload-artifact@v4
         with:
           name: website-download
-          path: ${{ runner.temp }}/website-download.zip
+          path: ${{ steps.clone.outputs.output_dir }}/
           if-no-files-found: error
-          retention-days: 7
