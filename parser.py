@@ -1,65 +1,71 @@
 
 import re
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
-# Folder containing the downloaded website files
-root = Path("youretheblessed.com")
+BASE_URL = "https://youretheblessed.com/"
+ROOT = Path("youretheblessed.com")
+OUTPUT = Path("found_urls.txt")
 
-# Patterns for finding URLs in JavaScript files
-patterns = [
-    re.compile(r'https?://[^\s"\'`<>]+'),
-    re.compile(r'["\'`](/[^"\'`\s<>]{1,300})["\'`]'),
+PATTERNS = [
+    re.compile(r"""https?://[^\s"'`<>\\]+"""),
+    re.compile(r"""["'`](/[^"'`\s<>]{1,300})["'`]"""),
 ]
 
+REGEX_FRAGMENTS = (
+    ".*", ".+", ".*?", ".+?", "([^", "(?:",
+    "\\", "$", "^", "[", "]", "{", "}",
+)
+
 found = set()
+files = list(ROOT.rglob("*.js"))
 
-if not root.exists():
-    raise SystemExit(
-        f"Folder not found: {root}\n"
-        "Make sure youretheblessed.com is in the repository."
-    )
+print(f"Scanning {len(files)} JavaScript files...")
 
-# Scan all JavaScript files, including subfolders
-js_files = list(root.rglob("*.js"))
-print(f"Scanning {len(js_files)} JavaScript files...\n")
-
-for path in js_files:
+for path in files:
     try:
         source = path.read_text(
             encoding="utf-8",
-            errors="ignore"
+            errors="ignore",
         )
-    except OSError as exc:
-        print(f"Could not read {path}: {exc}")
+    except OSError:
         continue
 
-    for pattern in patterns:
+    for pattern in PATTERNS:
         for match in pattern.findall(source):
-            value = match.rstrip("),;")
+            value = match.rstrip("),;.")
 
-            if value.startswith(("http://", "https://")):
-                hostname = urlparse(value).hostname
+            if not value or any(
+                marker in value for marker in REGEX_FRAGMENTS
+            ):
+                continue
 
-                if hostname and hostname.lower() == "youretheblessed.com":
-                    found.add(value)
+            if value.startswith("http://") or value.startswith("https://"):
+                parsed = urlparse(value)
 
-            elif value.startswith("/") and not value.startswith("//"):
-                found.add(
-                    "https://youretheblessed.com" + value
-                )
+                if parsed.hostname != "youretheblessed.com":
+                    continue
+            else:
+                parsed = urlparse(value)
 
-# Print sorted results
-for url in sorted(found):
-    print(url)
+                if not parsed.path.startswith("/"):
+                    continue
 
-print(f"\nTotal candidate URLs: {len(found)}")
+                value = urljoin(BASE_URL, value)
+                parsed = urlparse(value)
 
-# Save results to a text file
-output_file = Path("found_urls.txt")
-output_file.write_text(
+                if parsed.hostname != "youretheblessed.com":
+                    continue
+
+            if parsed.path in ("", "/") and not parsed.query:
+                continue
+
+            found.add(value)
+
+OUTPUT.write_text(
     "\n".join(sorted(found)) + ("\n" if found else ""),
-    encoding="utf-8"
+    encoding="utf-8",
 )
 
-print(f"Results saved to: {output_file}")
+print(f"\nTotal candidate URLs: {len(found)}")
+print(f"Results saved to: {OUTPUT}")
