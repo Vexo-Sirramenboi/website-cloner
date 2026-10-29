@@ -1,24 +1,8 @@
 
 #!/usr/bin/env python3
-"""Controlled static website downloader.
+"""Playwright-powered static website archiver.
 
-Install:
-    python -m pip install requests beautifulsoup4 lxml
-
-Examples:
-    python website_cloner.py https://example.com
-    python website_cloner.py https://example.com --depth 5
-    python website_cloner.py https://example.com --single-page
-    python website_cloner.py https://example.com --sitemaps
-    python website_cloner.py https://example.com --external-assets
-
-By default:
-- HTML pages are crawled only on the starting origin.
-- External assets are skipped.
-- Sitemaps are not crawled unless explicitly enabled.
-- JavaScript discovery is limited to static file imports.
-- Invalid URLs are ignored safely.
-
+Runs on GitHub Actions; no local installation is required.
 Only archive websites you own or have permission to copy.
 """
 
@@ -31,11 +15,16 @@ import re
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
+
 from collections import deque
 from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
+from playwright.sync_api import (
+    sync_playwright,
+    TimeoutError as PlaywrightTimeoutError,
+)
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -60,7 +49,13 @@ ASSET_EXTENSIONS = {
     ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".ico",
     ".bmp", ".avif", ".mp4", ".webm", ".ogg", ".mp3", ".wav",
     ".flac", ".woff", ".woff2", ".ttf", ".eot", ".otf", ".pdf",
+    ".wasm",
 }
+
+SKIP_SCHEMES = (
+    "data:", "blob:", "javascript:", "mailto:", "tel:",
+    "about:", "file:", "intent:", "ftp:",
+)
 
 CSS_URL = re.compile(
     r"""url\(\s*(?:(["'])(.*?)\1|([^)]*?))\s*\)""",
@@ -72,16 +67,10 @@ CSS_IMPORT = re.compile(
     re.I,
 )
 
-# Only static import/export declarations and literal imports.
 JS_IMPORT = re.compile(
     r"""(?:\bimport\s*(?:\(\s*)?|\bexport\s+[^;]*?\bfrom\s*)
         ["']([^"'\\]+)["']""",
     re.M | re.X,
-)
-
-SKIP_SCHEMES = (
-    "data:", "blob:", "javascript:", "mailto:", "tel:",
-    "about:", "file:", "intent:", "ftp:",
 )
 
 
@@ -91,24 +80,23 @@ def safe_name(value):
 
 
 def normalize(url):
-    """Normalize a URL, returning None for malformed URLs."""
+    """Normalize an HTTP(S) URL and reject malformed input."""
     try:
         url = urllib.parse.urldefrag(str(url).strip())[0]
-        p = urllib.parse.urlsplit(url)
+        parsed = urllib.parse.urlsplit(url)
 
-        if not p.scheme or not p.hostname:
+        if (
+            parsed.scheme.lower() not in ("http", "https")
+            or not parsed.hostname
+            or parsed.username
+            or parsed.password
+        ):
             return None
 
-        scheme = p.scheme.lower()
+        scheme = parsed.scheme.lower()
+        host = parsed.hostname.lower()
+        port = parsed.port
 
-        if scheme not in ("http", "https"):
-            return None
-
-        # Accessing .port can raise ValueError for malformed ports.
-        port = p.port
-        host = p.hostname.lower()
-
-        # Preserve IPv6 hostname syntax.
         if ":" in host and not host.startswith("["):
             host = f"[{host}]"
 
@@ -121,12 +109,12 @@ def normalize(url):
             netloc = f"{host}:{port}"
 
         path = urllib.parse.quote(
-            urllib.parse.unquote(p.path or "/"),
+            urllib.parse.unquote(parsed.path or "/"),
             safe="/%:@!$&'()*+,;=-._~",
         )
 
         return urllib.parse.urlunsplit(
-            (scheme, netloc, path, p.query, "")
+            (scheme, netloc, path, parsed.query, "")
         )
 
     except (ValueError, TypeError, UnicodeError):
@@ -134,7 +122,7 @@ def normalize(url):
 
 
 def safe_join(base, ref):
-    """Resolve a reference without allowing malformed URLs to crash."""
+    """Resolve a URL reference without crashing on malformed input."""
     if not ref:
         return None
 
@@ -152,43 +140,40 @@ def safe_join(base, ref):
         return None
 
 
-def origin(url):
-    p = urllib.parse.urlsplit(url)
-    return f"{p.scheme.lower()}://{p.netloc.lower()}"
-
-
-def local_path(url, root, base_host):
-    p = urllib.parse.urlsplit(url)
+def local_path(url, root, base_host, is_page=False):
+    """Convert a URL to a safe local file path."""
+    parsed = urllib.parse.urlsplit(url)
 
     parts = [
         safe_name(urllib.parse.unquote(part))
-        for part in p.path.split("/")
+        for part in parsed.path.split("/")
         if part
     ]
 
     if not parts:
-        parts = ["index.html"]
-    elif p.path.endswith("/"):
-        parts.append("index.html")
-    elif not Path(parts[-1]).suffix:
+        parts = ["index.html"] if is_page else ["index"]
+
+    elif parsed.path.endswith("/"):
+        parts.append("index.html" if is_page else "index")
+
+    elif is_page and not Path(parts[-1]).suffix:
         parts[-1] += ".html"
 
-    if p.query:
+    if parsed.query:
         digest = hashlib.sha256(
-            p.query.encode("utf-8")
+            parsed.query.encode("utf-8")
         ).hexdigest()[:12]
 
         stem, ext = os.path.splitext(parts[-1])
         parts[-1] = f"{stem}__q_{digest}{ext}"
 
-    hostname = (p.hostname or "").lower()
-
-    if hostname != base_host:
+    if (parsed.hostname or "").lower() != base_host:
         parts = [
             "_external",
-            safe_name(hostname or "unknown"),
+            safe_name(parsed.hostname or "unknown"),
         ] + parts
 
+    root = Path(root)
     target = root.joinpath(*parts)
 
     resolved_root = root.resolve()
@@ -201,7 +186,6 @@ def local_path(url, root, base_host):
         raise ValueError(f"Unsafe output path: {url}")
 
     return target
-
 
 class WebsiteCloner:
     def __init__(
@@ -216,6 +200,9 @@ class WebsiteCloner:
         timeout=25,
         external_assets=False,
         use_sitemaps=False,
+        scroll=True,
+        max_scrolls=25,
+        max_asset_bytes=50 * 1024 * 1024,
     ):
         if not urllib.parse.urlsplit(url).scheme:
             url = "https://" + url
@@ -227,22 +214,30 @@ class WebsiteCloner:
 
         parsed = urllib.parse.urlsplit(self.start)
 
-        self.origin_netloc = parsed.netloc.lower()
-        self.base_host = (parsed.hostname or "").lower()
-        self.root = Path(output)
+        self.base_host = parsed.hostname.lower()
+        self.start_origin = (
+            parsed.scheme.lower(),
+            parsed.netloc.lower(),
+        )
 
+        self.root = Path(output)
         self.depth = 0 if single_page else max(0, depth)
         self.single_page = single_page
         self.no_media = no_media
         self.delay = max(0, delay)
         self.limit = max(1, max_resources)
-        self.timeout = timeout
+        self.timeout = max(1, timeout)
         self.external_assets = external_assets
         self.use_sitemaps = use_sitemaps
+        self.scroll = scroll
+        self.max_scrolls = max(1, max_scrolls)
+        self.max_asset_bytes = max(1024, max_asset_bytes)
 
         self.session = requests.Session()
         self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (compatible; WebsiteArchiveBot/1.0)",
+            "User-Agent": (
+                "Mozilla/5.0 (compatible; WebsiteArchiveBot/2.0)"
+            ),
             "Accept": "*/*",
             "Accept-Language": "en-US,en;q=0.9",
         })
@@ -265,17 +260,24 @@ class WebsiteCloner:
         self.queued = set()
         self.done = set()
         self.failed = set()
-        self.visited_sitemaps = set()
         self.discovered = set()
+        self.visited_sitemaps = set()
         self.saved_paths = {}
+        self.redirects = {}
+        self.browser_assets = set()
+
+        self.playwright = None
+        self.browser = None
+        self.context = None
+        self.page = None
 
     def same_origin(self, url):
         try:
-            p = urllib.parse.urlsplit(url)
+            parsed = urllib.parse.urlsplit(url)
             return (
-                p.scheme in ("http", "https")
-                and p.netloc.lower() == self.origin_netloc
-            )
+                parsed.scheme.lower(),
+                parsed.netloc.lower(),
+            ) == self.start_origin
         except (ValueError, TypeError):
             return False
 
@@ -283,11 +285,10 @@ class WebsiteCloner:
         if self.same_origin(url):
             return True
 
-        # Never crawl external pages.
+        # Never crawl HTML pages on other origins.
         if kind == "page":
             return False
 
-        # External assets must be explicitly enabled.
         return self.external_assets
 
     def enqueue(self, ref, depth, base_url, kind="resource"):
@@ -296,29 +297,17 @@ class WebsiteCloner:
         if not full:
             return
 
-        try:
-            parsed = urllib.parse.urlsplit(full)
+        parsed = urllib.parse.urlsplit(full)
 
-            if (
-                parsed.scheme not in ("http", "https")
-                or not parsed.netloc
-                or parsed.username
-                or parsed.password
-            ):
-                return
-
-        except (ValueError, TypeError):
+        if not parsed.netloc:
             return
 
         if not self.allowed_resource(full, kind):
             return
 
-        # Do not download arbitrary external pages as resources.
-        # HTML navigation is always restricted to the starting origin.
+        # External resources must have a recognized asset extension.
         if kind == "resource" and not self.same_origin(full):
-            suffix = Path(parsed.path).suffix.lower()
-
-            if suffix not in ASSET_EXTENSIONS:
+            if Path(parsed.path).suffix.lower() not in ASSET_EXTENSIONS:
                 return
 
         if full in self.done or full in self.queued:
@@ -331,63 +320,162 @@ class WebsiteCloner:
         self.queue.append((full, depth, kind))
         self.discovered.add(full)
 
-    def discover_css(self, text, base, depth):
-        refs = []
+    def start_browser(self):
+        self.playwright = sync_playwright().start()
+        self.browser = self.playwright.chromium.launch(headless=True)
 
+        self.context = self.browser.new_context(
+            ignore_https_errors=False,
+            service_workers="allow",
+            viewport={"width": 1440, "height": 1000},
+        )
+
+        self.page = self.context.new_page()
+        self.page.set_default_timeout(self.timeout * 1000)
+
+        self.page.on("request", self.on_request)
+
+    def on_request(self, request):
+        """Record browser-requested assets for later downloading."""
+        try:
+            url = normalize(request.url)
+
+            if (
+                url
+                and self.allowed_resource(url, "resource")
+                and request.resource_type in {
+                    "stylesheet", "script", "image", "font",
+                    "media", "manifest", "texttrack",
+                }
+            ):
+                self.browser_assets.add(url)
+
+        except Exception as exc:
+            log.debug("Request observation failed: %s", exc)
+
+    def scroll_page(self):
+        """Scroll gradually to trigger common lazy-loading behavior."""
+        previous_height = -1
+        stable_steps = 0
+
+        for _ in range(self.max_scrolls):
+            try:
+                height = self.page.evaluate("""
+                    () => {
+                        const height =
+                            document.documentElement.scrollHeight;
+
+                        window.scrollBy(
+                            0,
+                            Math.max(300, window.innerHeight * 0.8)
+                        );
+
+                        return height;
+                    }
+                """)
+
+                if height == previous_height:
+                    stable_steps += 1
+                else:
+                    stable_steps = 0
+
+                previous_height = height
+
+                if stable_steps >= 3:
+                    break
+
+                self.page.wait_for_timeout(200)
+
+            except Exception:
+                break
+
+        try:
+            self.page.evaluate("window.scrollTo(0, 0)")
+            self.page.wait_for_timeout(200)
+        except Exception:
+            pass
+
+    def render_page(self, url):
+        """Render a page with Chromium and return its HTML."""
+        try:
+            response = self.page.goto(
+                url,
+                wait_until="domcontentloaded",
+                timeout=self.timeout * 1000,
+            )
+
+        except PlaywrightTimeoutError:
+            log.warning("Navigation timed out: %s", url)
+
+        except Exception as exc:
+            log.warning("Navigation failed: %s (%s)", url, exc)
+            return None
+
+        if response is not None and response.status >= 400:
+            log.warning("HTTP %s: %s", response.status, url)
+
+        # Some sites never become network-idle, so this wait is bounded.
+        try:
+            self.page.wait_for_load_state(
+                "networkidle",
+                timeout=min(5000, self.timeout * 1000),
+            )
+        except PlaywrightTimeoutError:
+            pass
+
+        if self.scroll:
+            self.scroll_page()
+
+        try:
+            final_url = normalize(self.page.url)
+
+            if not final_url or not self.same_origin(final_url):
+                log.warning("Redirect outside starting origin: %s", url)
+                return None
+
+            self.redirects[url] = final_url
+            return self.page.content()
+
+        except Exception as exc:
+            log.warning("Could not read rendered HTML: %s", exc)
+            return None
+
+    def discover_css(self, text, base, depth):
         for match in CSS_URL.finditer(text):
             ref = (match.group(2) or match.group(3) or "").strip()
             ref = ref.strip("'\"")
 
             if ref:
-                refs.append(ref)
+                self.enqueue(ref, depth, base, "resource")
 
         for match in CSS_IMPORT.finditer(text):
-            refs.append(match.group(1).strip())
-
-        for ref in refs:
-            self.enqueue(ref, depth, base, "resource")
+            self.enqueue(
+                match.group(1).strip(), depth, base, "resource"
+            )
 
     def discover_js(self, text, base, depth):
-        """Follow only plausible static file imports.
-
-        Arbitrary URLs inside JS strings are deliberately ignored.
-        This prevents discovery of video URLs, analytics endpoints,
-        documentation links, and unrelated external sites.
-        """
-        refs = set()
-
+        """Discover plausible static JavaScript imports."""
         for match in JS_IMPORT.finditer(text):
             ref = match.group(1).strip()
-
-            if not ref:
-                continue
-
             parsed = urllib.parse.urlsplit(ref)
-            suffix = Path(parsed.path).suffix.lower()
 
-            # Ignore bare package names such as "react".
             if (
                 ref.startswith(("./", "../", "/"))
-                or suffix in ASSET_EXTENSIONS
+                or Path(parsed.path).suffix.lower() in ASSET_EXTENSIONS
             ):
-                refs.add(ref)
-
-        for ref in refs:
-            self.enqueue(ref, depth, base, "resource")
+                self.enqueue(ref, depth, base, "resource")
 
     def discover_html(self, soup, url, depth):
         base_tag = soup.find("base", href=True)
-        base_url = safe_join(url, base_tag["href"]) if base_tag else url
-        base_url = base_url or url
+        base = safe_join(url, base_tag["href"]) if base_tag else url
+        base = base or url
 
-        # Crawl same-origin HTML navigation links only.
+        # Discover same-origin navigation links.
         if depth < self.depth and not self.single_page:
             for tag in soup.find_all("a", href=True):
-                self.enqueue(
-                    tag["href"], depth + 1, base_url, "page"
-                )
+                self.enqueue(tag["href"], depth + 1, base, "page")
 
-        # Resources embedded in HTML.
+        # Discover common image, media, and lazy-load attributes.
         resource_tags = [
             "img", "source", "video", "audio", "track",
             "embed", "object", "input",
@@ -401,60 +489,60 @@ class WebsiteCloner:
 
         for tag in soup.find_all(resource_tags):
             for attr in resource_attrs:
-                value = tag.get(attr)
-
-                if value:
-                    self.enqueue(
-                        value, depth, base_url, "resource"
-                    )
+                if tag.get(attr):
+                    self.enqueue(tag[attr], depth, base, "resource")
 
             for attr in ("srcset", "data-srcset"):
                 value = tag.get(attr)
 
-                if not value:
-                    continue
+                if value:
+                    for item in value.split(","):
+                        bits = item.strip().split()
 
-                for item in value.split(","):
-                    bits = item.strip().split()
+                        if bits:
+                            self.enqueue(
+                                bits[0], depth, base, "resource"
+                            )
 
-                    if bits:
-                        self.enqueue(
-                            bits[0], depth, base_url, "resource"
-                        )
-
-        # Stylesheets and resource hints.
+        # Stylesheets, icons, preloads, and manifests.
         for tag in soup.find_all("link", href=True):
-            rel = " ".join(tag.get("rel", [])).lower()
+            rel = [str(x).lower() for x in tag.get("rel", [])]
 
-            if any(name in rel.split() for name in (
+            if any(x in rel for x in (
                 "stylesheet", "icon", "preload", "modulepreload",
-                "manifest", "prefetch",
-            )) or "apple-touch-icon" in rel:
-                self.enqueue(
-                    tag["href"], depth, base_url, "resource"
-                )
+                "manifest", "prefetch", "apple-touch-icon",
+            )):
+                self.enqueue(tag["href"], depth, base, "resource")
 
-        # Actual script files, not URLs mentioned in the HTML.
         for tag in soup.find_all("script", src=True):
-            self.enqueue(
-                tag["src"], depth, base_url, "resource"
-            )
+            self.enqueue(tag["src"], depth, base, "resource")
 
-        # Inline CSS.
+        # Inline CSS may contain images, fonts, or imported stylesheets.
         for tag in soup.find_all("style"):
-            self.discover_css(
-                tag.get_text() or "", base_url, depth
-            )
+            self.discover_css(tag.get_text() or "", base, depth)
 
         for tag in soup.find_all(style=True):
-            self.discover_css(
-                tag.get("style", ""), base_url, depth
+            self.discover_css(tag.get("style", ""), base, depth)
+
+    def discover_rendered_page(self, url, depth):
+        """Collect links and assets visible after JavaScript runs."""
+        try:
+            links = self.page.locator("a[href]").evaluate_all(
+                "elements => elements.map(element => element.href)"
             )
 
-        # Do not follow arbitrary URLs from meta tags or refresh links.
-        # They can point to unrelated sites or tracking endpoints.
+            if depth < self.depth and not self.single_page:
+                for link in links:
+                    self.enqueue(link, depth + 1, url, "page")
+
+            for asset in list(self.browser_assets):
+                self.enqueue(asset, depth, url, "resource")
+
+        except Exception as exc:
+            log.debug("Rendered discovery failed: %s", exc)
 
     def discover_sitemap(self, url):
+        """Discover same-origin pages from a sitemap."""
         if url in self.visited_sitemaps:
             return
 
@@ -466,9 +554,16 @@ class WebsiteCloner:
 
         try:
             response = self.session.get(
-                url, timeout=self.timeout, allow_redirects=True
+                url,
+                timeout=self.timeout,
+                allow_redirects=True,
             )
             response.raise_for_status()
+
+            if len(response.content) > 10 * 1024 * 1024:
+                log.warning("Sitemap exceeds size limit: %s", url)
+                return
+
             root = ET.fromstring(response.content)
 
         except (
@@ -483,16 +578,12 @@ class WebsiteCloner:
             if element.tag.rsplit("}", 1)[-1].lower() != "loc":
                 continue
 
-            loc = (element.text or "").strip()
-            full = safe_join(url, loc)
+            full = safe_join(url, (element.text or "").strip())
 
             if not full or not self.same_origin(full):
                 continue
 
-            path = urllib.parse.urlsplit(full).path.lower()
-
-            if path.endswith(".xml"):
-                # Follow sitemap indexes, but limit recursion.
+            if urllib.parse.urlsplit(full).path.lower().endswith(".xml"):
                 if len(self.visited_sitemaps) < 20:
                     self.discover_sitemap(full)
             else:
@@ -501,56 +592,88 @@ class WebsiteCloner:
             if len(self.done) + len(self.queued) >= self.limit:
                 return
 
-    def rel(self, asset_url, from_path):
+    def relative_asset(self, url, path):
+        """Return the relative local path for a downloaded resource."""
         try:
             target = local_path(
-                asset_url, self.root, self.base_host
+                url,
+                self.root,
+                self.base_host,
+                is_page=False,
             )
+
             return os.path.relpath(
-                target, from_path.parent
+                target, path.parent
             ).replace("\\", "/")
+
         except (ValueError, OSError):
             return None
 
     def rewrite_css(self, text, url, path):
-        def replace(match):
+        """Rewrite CSS URLs only when their assets were downloaded."""
+
+        def replace_url(match):
             quote = match.group(1) or ""
-            ref = (match.group(2) or match.group(3) or "").strip()
-            ref = ref.strip("'\"")
+            ref = (
+                match.group(2) or match.group(3) or ""
+            ).strip().strip("'\"")
 
             if (
                 not ref
-                or ref.startswith(SKIP_SCHEMES)
                 or ref.startswith("#")
+                or ref.lower().startswith(SKIP_SCHEMES)
             ):
                 return match.group(0)
 
             full = safe_join(url, ref)
 
-            if not full:
+            if (
+                not full
+                or full not in self.done
+                or not self.allowed_resource(full, "resource")
+            ):
                 return match.group(0)
 
-            # Keep external URLs intact unless external assets are enabled.
-            if not self.allowed_resource(full, "resource"):
-                return match.group(0)
-
-            local = self.rel(full, path)
+            local = self.relative_asset(full, path)
 
             if not local:
                 return match.group(0)
 
             return f"url({quote}{local}{quote})"
 
-        return CSS_URL.sub(replace, text)
+        text = CSS_URL.sub(replace_url, text)
+
+        def replace_import(match):
+            ref = match.group(1).strip()
+            full = safe_join(url, ref)
+
+            if (
+                not full
+                or full not in self.done
+                or not self.allowed_resource(full, "resource")
+            ):
+                return match.group(0)
+
+            local = self.relative_asset(full, path)
+
+            if not local:
+                return match.group(0)
+
+            return match.group(0).replace(ref, local, 1)
+
+        return CSS_IMPORT.sub(replace_import, text)
 
     def rewrite_html(self, soup, url, path):
-        attrs = (
+        """Rewrite references to assets saved in the archive."""
+
+        resource_attrs = (
             "src", "poster", "data-src", "data-lazy-src",
             "data-original", "data-url", "data-original-src",
+            "data-src-url",
         )
 
         for tag in soup.find_all(True):
-            for attr in attrs:
+            for attr in resource_attrs:
                 value = tag.get(attr)
 
                 if not value or value.startswith("#"):
@@ -558,67 +681,63 @@ class WebsiteCloner:
 
                 full = safe_join(url, value)
 
-                if not full:
+                if (
+                    not full
+                    or full not in self.done
+                    or not self.allowed_resource(full, "resource")
+                ):
                     continue
 
-                if not self.allowed_resource(full, "resource"):
-                    continue
-
-                # Only rewrite files that were actually processed.
-                if full not in self.done:
-                    continue
-
-                local = self.rel(full, path)
+                local = self.relative_asset(full, path)
 
                 if local:
                     tag[attr] = local
 
-            for attr in ("href", "srcset", "data-srcset"):
+            # Rewrite downloaded asset links, but keep page navigation
+            # links intact.
+            value = tag.get("href")
+
+            if value:
+                full = safe_join(url, value)
+
+                if (
+                    full
+                    and full in self.done
+                    and Path(
+                        urllib.parse.urlsplit(full).path
+                    ).suffix.lower() in ASSET_EXTENSIONS
+                    and self.allowed_resource(full, "resource")
+                ):
+                    local = self.relative_asset(full, path)
+
+                    if local:
+                        tag["href"] = local
+
+            for attr in ("srcset", "data-srcset"):
                 value = tag.get(attr)
 
                 if not value:
                     continue
 
-                if attr == "href":
-                    full = safe_join(url, value)
+                rewritten_items = []
 
-                    if not full:
+                for item in value.split(","):
+                    bits = item.strip().split()
+
+                    if not bits:
                         continue
 
-                    # Rewrite only downloaded local resources.
-                    # Navigation links are handled separately.
-                    if (
-                        full in self.done
-                        and self.same_origin(full)
-                        and Path(
-                            urllib.parse.urlsplit(full).path
-                        ).suffix.lower() in ASSET_EXTENSIONS
-                    ):
-                        local = self.rel(full, path)
+                    full = safe_join(url, bits[0])
+
+                    if full and full in self.done:
+                        local = self.relative_asset(full, path)
 
                         if local:
-                            tag[attr] = local
+                            bits[0] = local
 
-                else:
-                    items = []
+                    rewritten_items.append(" ".join(bits))
 
-                    for item in value.split(","):
-                        bits = item.strip().split()
-
-                        if not bits:
-                            continue
-
-                        full = safe_join(url, bits[0])
-
-                        if full and full in self.done:
-                            local = self.rel(full, path)
-
-                            if local:
-                                bits[0] = local
-
-                        items.append(" ".join(bits))
-
-                    tag[attr] = ", ".join(items)
+                tag[attr] = ", ".join(rewritten_items)
 
             if tag.get("style"):
                 tag["style"] = self.rewrite_css(
@@ -634,173 +753,120 @@ class WebsiteCloner:
                     self.rewrite_css(original, url, path)
                 )
 
-        # Remove the base URL so relative paths work locally.
+        # Remove base tags so they do not override local paths.
         for tag in soup.find_all("base"):
             tag.decompose()
 
         return soup
 
     def save(self, path, data):
+        """Create parent directories and save a file."""
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
 
         try:
-            relative = path.relative_to(self.root)
+            shown = path.relative_to(self.root)
         except ValueError:
-            relative = path
+            shown = path
 
-        log.info("Saved: %s", relative)
+        log.info("Saved: %s", shown)
 
-    def run(self):
-        self.root.mkdir(parents=True, exist_ok=True)
-
-        self.enqueue(self.start, 0, self.start, "page")
-
-        # Sitemaps are optional to prevent unexpectedly huge crawls.
-        if self.use_sitemaps:
-            candidates = [
-                urllib.parse.urljoin(self.start, "/sitemap.xml"),
-                urllib.parse.urljoin(self.start, "/sitemap_index.xml"),
-                urllib.parse.urljoin(self.start, "/wp-sitemap.xml"),
-            ]
-
-            robots_url = urllib.parse.urljoin(
-                self.start, "/robots.txt"
-            )
-
-            try:
-                response = self.session.get(
-                    robots_url, timeout=self.timeout
-                )
-
-                if response.status_code < 400:
-                    for line in response.text.splitlines():
-                        match = re.match(
-                            r"^\s*Sitemap\s*:\s*(\S+)",
-                            line,
-                            re.I,
-                        )
-
-                        if match:
-                            sitemap = safe_join(
-                                robots_url, match.group(1)
-                            )
-
-                            if sitemap and self.same_origin(sitemap):
-                                candidates.append(sitemap)
-
-            except requests.RequestException as exc:
-                log.info("Could not read robots.txt: %s", exc)
-
-            for candidate in dict.fromkeys(candidates):
-                if len(self.done) + len(self.queued) >= self.limit:
-                    break
-
-                self.discover_sitemap(candidate)
-
-        log.info("Starting: %s", self.start)
-        log.info(
-            "Output: %s | depth: %d | limit: %d | external assets: %s",
-            self.root,
-            self.depth,
-            self.limit,
-            self.external_assets,
-        )
-
-        while self.queue and len(self.done) < self.limit:
-            url, depth, kind = self.queue.popleft()
-            self.queued.discard(url)
-
-            if url in self.done:
-                continue
-
-            self.done.add(url)
-
-            log.info(
-                "Fetching [%d/%d] depth=%d kind=%s: %s",
-                len(self.done), self.limit, depth, kind, url,
-            )
-
-            try:
-                response = self.session.get(
-                    url,
-                    timeout=self.timeout,
-                    allow_redirects=True,
-                )
+    def fetch_resource(self, url):
+        """Download one resource with a maximum response-size limit."""
+        try:
+            with self.session.get(
+                url,
+                timeout=self.timeout,
+                allow_redirects=True,
+                stream=True,
+            ) as response:
                 response.raise_for_status()
 
-            except requests.RequestException as exc:
-                self.failed.add(url)
-                log.warning("Failed: %s (%s)", url, exc)
-                continue
+                final_url = normalize(response.url)
 
-            final_url = normalize(response.url)
+                if (
+                    not final_url
+                    or not self.allowed_resource(
+                        final_url, "resource"
+                    )
+                ):
+                    raise ValueError(
+                        "Redirect to a disallowed resource"
+                    )
 
-            if not final_url:
-                self.failed.add(url)
-                log.warning("Invalid redirect destination: %s", url)
-                continue
-
-            # Do not follow redirects into unrelated HTML pages.
-            ctype = response.headers.get(
-                "Content-Type", ""
-            ).lower()
-
-            if (
-                not self.same_origin(final_url)
-                and "text/html" in ctype
-            ):
-                log.info("Skipping external HTML redirect: %s", final_url)
-                continue
-
-            try:
-                path = local_path(
-                    url, self.root, self.base_host
+                content_length = response.headers.get(
+                    "Content-Length"
                 )
-            except ValueError as exc:
-                self.failed.add(url)
-                log.warning("%s", exc)
-                continue
 
-            suffix = path.suffix.lower()
+                if content_length:
+                    try:
+                        if int(content_length) > self.max_asset_bytes:
+                            raise ValueError(
+                                "Resource exceeds size limit"
+                            )
+                    except ValueError as exc:
+                        if str(exc) == "Resource exceeds size limit":
+                            raise
 
-            if self.no_media and suffix in MEDIA:
-                continue
+                chunks = []
+                size = 0
 
-            data = response.content
+                for chunk in response.iter_content(64 * 1024):
+                    if not chunk:
+                        continue
 
-            is_html = (
-                "text/html" in ctype
-                or suffix in (".html", ".htm")
+                    size += len(chunk)
+
+                    if size > self.max_asset_bytes:
+                        raise ValueError(
+                            "Resource exceeds size limit"
+                        )
+
+                    chunks.append(chunk)
+
+                return (
+                    final_url,
+                    b"".join(chunks),
+                    response.headers.get(
+                        "Content-Type", ""
+                    ).lower(),
+                )
+
+        except (requests.RequestException, ValueError) as exc:
+            log.warning(
+                "Resource download failed: %s (%s)",
+                url,
+                exc,
             )
-            is_css = "text/css" in ctype or suffix == ".css"
-            is_js = (
-                any(x in ctype for x in (
-                    "javascript", "ecmascript"
-                ))
-                or suffix in (".js", ".mjs", ".cjs")
+            return None, None, None
+
+    def process_resource(self, url):
+        """Download and save a resource, processing CSS and JS."""
+        final_url, data, content_type = self.fetch_resource(url)
+
+        if data is None:
+            self.failed.add(url)
+            return
+
+        suffix = Path(
+            urllib.parse.urlsplit(final_url).path
+        ).suffix.lower()
+
+        if self.no_media and suffix in MEDIA:
+            return
+
+        try:
+            path = local_path(
+                url,
+                self.root,
+                self.base_host,
+                is_page=False,
             )
 
-            if is_html:
-                soup = BeautifulSoup(data, "lxml")
-                self.discover_html(soup, final_url, depth)
+            if "text/css" in content_type or suffix == ".css":
+                text = data.decode("utf-8", errors="replace")
 
-                rewritten = self.rewrite_html(
-                    soup, final_url, path
-                )
-
-                self.save(
-                    path,
-                    str(rewritten).encode("utf-8"),
-                )
-
-            elif is_css:
-                text = data.decode(
-                    response.encoding or "utf-8",
-                    errors="replace",
-                )
-
-                self.discover_css(text, final_url, depth)
+                self.discover_css(text, final_url, 0)
 
                 rewritten = self.rewrite_css(
                     text, final_url, path
@@ -808,60 +874,202 @@ class WebsiteCloner:
 
                 self.save(path, rewritten.encode("utf-8"))
 
-            elif is_js:
-                text = data.decode(
-                    response.encoding or "utf-8",
-                    errors="replace",
-                )
+            elif (
+                "javascript" in content_type
+                or "ecmascript" in content_type
+                or suffix in (".js", ".mjs", ".cjs")
+            ):
+                text = data.decode("utf-8", errors="replace")
 
-                self.discover_js(text, final_url, depth)
+                self.discover_js(text, final_url, 0)
                 self.save(path, data)
 
             else:
                 self.save(path, data)
 
             self.saved_paths[url] = str(path)
-            time.sleep(self.delay)
 
-        report = {
-            "start_url": self.start,
-            "downloaded_or_processed": len(self.done),
-            "discovered": len(self.discovered),
-            "failed_count": len(self.failed),
-            "unprocessed_count": len(self.queue),
-            "failed_urls": sorted(self.failed),
-            "remaining_urls": [
-                item[0] for item in self.queue
-            ],
-        }
+            if final_url != url:
+                self.saved_paths[final_url] = str(path)
 
-        report_path = self.root / "_crawl_report.json"
-        report_path.write_text(
-            json.dumps(report, indent=2),
-            encoding="utf-8",
-        )
-
-        log.info(
-            "Finished. Processed: %d | Failed: %d | Remaining: %d",
-            len(self.done),
-            len(self.failed),
-            len(self.queue),
-        )
-        log.info("Crawl report: %s", report_path)
-
-        for failed_url in sorted(self.failed)[:50]:
-            log.warning("Unfetched URL: %s", failed_url)
-
-        if self.queue:
+        except (ValueError, OSError) as exc:
+            self.failed.add(url)
             log.warning(
-                "Resource limit reached or URLs remain queued: %d",
+                "Could not save resource %s: %s", url, exc
+            )
+
+    def process_page(self, url, depth):
+        """Render a page and save its resulting HTML."""
+        html = self.render_page(url)
+
+        if html is None:
+            self.failed.add(url)
+            return
+
+        try:
+            final_url = self.redirects.get(url, url)
+
+            path = local_path(
+                url,
+                self.root,
+                self.base_host,
+                is_page=True,
+            )
+
+            soup = BeautifulSoup(html, "lxml")
+
+            self.discover_html(soup, final_url, depth)
+            self.discover_rendered_page(final_url, depth)
+
+            rewritten = self.rewrite_html(
+                soup, final_url, path
+            )
+
+            self.save(
+                path,
+                str(rewritten).encode("utf-8"),
+            )
+
+            self.saved_paths[url] = str(path)
+            self.saved_paths[final_url] = str(path)
+
+        except (ValueError, OSError) as exc:
+            self.failed.add(url)
+            log.warning(
+                "Could not save page %s: %s", url, exc
+            )
+
+    def run(self):
+        self.root.mkdir(parents=True, exist_ok=True)
+
+        self.start_browser()
+
+        try:
+            self.enqueue(self.start, 0, self.start, "page")
+
+            if self.use_sitemaps:
+                candidates = [
+                    urllib.parse.urljoin(self.start, "/sitemap.xml"),
+                    urllib.parse.urljoin(self.start, "/sitemap_index.xml"),
+                    urllib.parse.urljoin(self.start, "/wp-sitemap.xml"),
+                ]
+
+                robots_url = urllib.parse.urljoin(
+                    self.start, "/robots.txt"
+                )
+
+                try:
+                    response = self.session.get(
+                        robots_url, timeout=self.timeout
+                    )
+
+                    if response.status_code < 400:
+                        for line in response.text.splitlines():
+                            match = re.match(
+                                r"^\s*Sitemap\s*:\s*(\S+)",
+                                line,
+                                re.I,
+                            )
+
+                            if match:
+                                sitemap = safe_join(
+                                    robots_url, match.group(1)
+                                )
+
+                                if sitemap and self.same_origin(sitemap):
+                                    candidates.append(sitemap)
+
+                except requests.RequestException as exc:
+                    log.info("Could not read robots.txt: %s", exc)
+
+                for candidate in dict.fromkeys(candidates):
+                    if len(self.done) + len(self.queued) >= self.limit:
+                        break
+
+                    self.discover_sitemap(candidate)
+
+            log.info("Starting: %s", self.start)
+            log.info("Output: %s", self.root)
+            log.info("Depth: %d | Limit: %d", self.depth, self.limit)
+
+            while self.queue and len(self.done) < self.limit:
+                url, depth, kind = self.queue.popleft()
+                self.queued.discard(url)
+
+                if url in self.done:
+                    continue
+
+                self.done.add(url)
+
+                log.info(
+                    "Processing [%d/%d] depth=%d type=%s: %s",
+                    len(self.done),
+                    self.limit,
+                    depth,
+                    kind,
+                    url,
+                )
+
+                if kind == "page":
+                    self.process_page(url, depth)
+                else:
+                    self.process_resource(url)
+
+                time.sleep(self.delay)
+
+            report = {
+                "start_url": self.start,
+                "downloaded_or_processed": len(self.done),
+                "discovered": len(self.discovered),
+                "failed_count": len(self.failed),
+                "unprocessed_count": len(self.queue),
+                "failed_urls": sorted(self.failed),
+                "remaining_urls": [
+                    item[0] for item in self.queue
+                ],
+                "saved_files": self.saved_paths,
+            }
+
+            report_path = self.root / "_crawl_report.json"
+
+            report_path.write_text(
+                json.dumps(report, indent=2),
+                encoding="utf-8",
+            )
+
+            log.info(
+                "Finished. Processed: %d | Failed: %d | Remaining: %d",
+                len(self.done),
+                len(self.failed),
                 len(self.queue),
             )
+
+            log.info("Crawl report: %s", report_path)
+
+            for failed_url in sorted(self.failed)[:50]:
+                log.warning("Unfetched URL: %s", failed_url)
+
+            if self.queue:
+                log.warning(
+                    "Some URLs remain queued: %d", len(self.queue)
+                )
+
+        finally:
+            if self.context:
+                self.context.close()
+
+            if self.browser:
+                self.browser.close()
+
+            if self.playwright:
+                self.playwright.stop()
+
+            self.session.close()
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Download a controlled static website archive."
+        description="Archive a JavaScript-rendered website with Playwright."
     )
 
     parser.add_argument("url")
@@ -877,13 +1085,13 @@ def main():
     parser.add_argument(
         "--single-page",
         action="store_true",
-        help="Download the start page and its discovered resources only",
+        help="Download only the starting page and discovered resources",
     )
 
     parser.add_argument(
         "--no-media",
         action="store_true",
-        help="Skip downloading common media files",
+        help="Skip common media files",
     )
 
     parser.add_argument(
@@ -903,19 +1111,40 @@ def main():
     parser.add_argument(
         "--timeout",
         type=float,
-        default=25,
+        default=30,
+        help="Page and request timeout in seconds",
     )
 
     parser.add_argument(
         "--external-assets",
         action="store_true",
-        help="Allow downloading external CSS, JS, fonts and other assets",
+        help="Allow downloading recognized assets from external origins",
     )
 
     parser.add_argument(
         "--sitemaps",
         action="store_true",
         help="Discover pages from sitemap files",
+    )
+
+    parser.add_argument(
+        "--no-scroll",
+        action="store_true",
+        help="Disable automatic scrolling for lazy-loaded content",
+    )
+
+    parser.add_argument(
+        "--max-scrolls",
+        type=int,
+        default=25,
+        help="Maximum scrolling steps per page",
+    )
+
+    parser.add_argument(
+        "--max-asset-mb",
+        type=float,
+        default=50,
+        help="Maximum individual resource size in MB",
     )
 
     args = parser.parse_args()
@@ -945,6 +1174,11 @@ def main():
             timeout=args.timeout,
             external_assets=args.external_assets,
             use_sitemaps=args.sitemaps,
+            scroll=not args.no_scroll,
+            max_scrolls=args.max_scrolls,
+            max_asset_bytes=max(
+                1024, int(args.max_asset_mb * 1024 * 1024)
+            ),
         )
 
         cloner.run()
